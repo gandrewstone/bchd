@@ -646,7 +646,7 @@ func TestRFC6979(t *testing.T) {
 		hash := sha256.Sum256([]byte(test.msg))
 
 		// Ensure deterministically generated nonce is the expected value.
-		gotNonce := nonceRFC6979(privKey.D, hash[:]).Bytes()
+		gotNonce := nonceRFC6979(privKey.D, hash[:], nil).Bytes()
 		wantNonce := decodeHex(test.nonce)
 		if !bytes.Equal(gotNonce, wantNonce) {
 			t.Errorf("NonceRFC6979 #%d (%s): Nonce is incorrect: "+
@@ -691,5 +691,102 @@ func TestSignatureIsEqual(t *testing.T) {
 	if sig1.IsEqual(sig2) {
 		t.Fatalf("value of IsEqual is incorrect, %v is not "+
 			"equal to %v", sig1, sig2)
+	}
+}
+
+func TestSchnorrSign(t *testing.T) {
+	m := make([]byte, 32)
+	rand.Read(m)
+
+	priv, err := NewPrivateKey(S256())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := signSchnorr(priv, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := sig.VerifySchnorr(m, priv.PubKey())
+	if !valid {
+		t.Fatal("Invalid signature")
+	}
+
+	pubHex := "02DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+	pubBytes, err := hex.DecodeString(pubHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pub, err := ParsePubKey(pubBytes, S256())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m2Hex := "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+	m2, err := hex.DecodeString(m2Hex)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sigHex := "2A298DACAE57395A15D0795DDBFD1DCB564DA82B0F269BC70A74F8220429BA1D1E51A22CCEC35599B8F266912281F8365FFC2D035A230434A1A64DC59F7013FD"
+	sig2bytes, err := hex.DecodeString(sigHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := make([]byte, 32)
+	for i:=0; i<32; i++ {
+		r[i] = sig2bytes[32 - 1 - i]
+	}
+
+	s := make([]byte, 32)
+	for i:=0; i<32; i++ {
+		s[i] = sig2bytes[64 - 1 - i]
+	}
+
+	sig2 := Signature{
+		R: new(big.Int).SetBytes(sig2bytes[:32]),
+		S: new(big.Int).SetBytes(sig2bytes[32:]),
+	}
+
+	fmt.Println(sig2.VerifySchnorr(m2, pub))
+}
+
+func BenchmarkSchnorr(b *testing.B) {
+	m := make([]byte, 32)
+	rand.Read(m)
+
+	priv, err := NewPrivateKey(S256())
+	if err != nil {
+		b.Fatal(err)
+	}
+	sig, err := signSchnorr(priv, m,)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i:=0; i<b.N; i++ {
+		valid := sig.VerifySchnorr(m, priv.PubKey())
+		if !valid {
+			b.Fatal("Invalid signature")
+		}
+	}
+}
+
+func BenchmarkECDSA(b *testing.B) {
+	m := make([]byte, 32)
+	rand.Read(m)
+	priv, err := NewPrivateKey(S256())
+	if err != nil {
+		b.Fatal(err)
+	}
+	sig2, err := priv.Sign(m)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i:=0; i<b.N; i++ {
+		valid := sig2.Verify(m, priv.PubKey())
+		if !valid {
+			b.Fatal("Invalid signature")
+		}
 	}
 }

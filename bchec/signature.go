@@ -77,6 +77,52 @@ func (sig *Signature) Verify(hash []byte, pubKey *PublicKey) bool {
 	return ecdsa.Verify(pubKey.ToECDSA(), hash, sig.R, sig.S)
 }
 
+func (sig *Signature) VerifySchnorr(hash []byte, pubKey *PublicKey) bool {
+
+	// This schnorr specification is specific to the secp256k1 curve so if the
+	// provided curve is not a KoblitizCurve then we'll just return false.
+	curve, ok := pubKey.Curve.(*KoblitzCurve)
+	if !ok {
+		return false
+	}
+
+	// Signature is invalid if s >= order or r >= p.
+	if sig.S.Cmp(curve.Params().N) >= 0 || sig.R.Cmp(curve.Params().P) >= 0 {
+		return false
+	}
+
+	// Compute scalar e = Hash(r || compressed(P) || m) mod N
+	eBytes := sha256.Sum256(append(append(sig.R.Bytes(), pubKey.SerializeCompressed()...), hash...))
+	e := new(big.Int).SetBytes(eBytes[:])
+	e.Mod(e, curve.Params().N)
+
+	// Compute point R = s * G - e * P.
+	sgx, sgy, sgz := curve.scalarBaseMultJacobian(sig.S.Bytes())
+	epx, epy, epz := curve.scalarMultJacobian(pubKey.X, pubKey.Y, e.Bytes())
+	epy.Negate(1)
+	rx, ry, rz := new(fieldVal), new(fieldVal), new(fieldVal)
+	curve.addJacobian(sgx, sgy, sgz, epx, epy, epz, rx, ry, rz)
+
+	// Check that R is not infinity
+	if rz.Equals(new(fieldVal).SetInt(0)) {
+		return false
+	}
+
+	// Check that R.y is quadratic residue
+	yz := ry.Mul(rz).Normalize()
+	b := yz.Bytes()
+	if big.Jacobi(new(big.Int).SetBytes(b[:]), curve.P) != 1 {
+		return false
+	}
+
+	// Check R values match
+	fieldR := new(fieldVal).SetByteSlice(sig.R.Bytes())
+	if !rx.Equals(rz.Mul(rz).Mul(fieldR)) {
+		return false
+	}
+	return true
+}
+
 // IsEqual compares this Signature instance to the one passed, returning true
 // if both Signatures are equivalent. A signature is equivalent to another, if
 // they both have the same scalar value for R and S.
@@ -418,13 +464,39 @@ func RecoverCompact(curve *KoblitzCurve, signature,
 	return key, ((signature[0] - 27) & 4) == 4, nil
 }
 
+func signSchnorr(privateKey *PrivateKey, hash []byte) (*Signature, error) {
+	additionalData := []byte{'S', 'c', 'h', 'n', 'o', 'r', 'r', '+', 'S', 'H', 'A', '2', '5', '6', ' ', ' '}
+	k := nonceRFC6979(privateKey.D, hash, additionalData)
+	// Compute point R = k * G
+	rx, ry := privateKey.Curve.ScalarBaseMult(k.Bytes())
+
+	//  Negate nonce if R.y is not a quadratic residue.
+	if big.Jacobi(ry, privateKey.Params().P) != 1 {
+		k = k.Neg(k)
+	}
+
+	// Compute scalar e = Hash(R.x || compressed(P) || m)
+	eBytes := sha256.Sum256(append(append(rx.Bytes(), privateKey.PubKey().SerializeCompressed()...), hash...))
+	e := new(big.Int).SetBytes(eBytes[:])
+	e.Mod(e, privateKey.Params().N)
+
+	// Compute scalar s = (k + e * x) mod N
+	x := new(big.Int).SetBytes(privateKey.Serialize())
+	s := e.Mul(e, x)
+	s.Add(s, k)
+	s.Mod(s, privateKey.Params().N)
+	return &Signature{
+		R: rx,
+		S: s,
+	}, nil
+}
+
 // signRFC6979 generates a deterministic ECDSA signature according to RFC 6979 and BIP 62.
 func signRFC6979(privateKey *PrivateKey, hash []byte) (*Signature, error) {
-
 	privkey := privateKey.ToECDSA()
 	N := S256().N
 	halfOrder := S256().halfOrder
-	k := nonceRFC6979(privkey.D, hash)
+	k := nonceRFC6979(privkey.D, hash, nil)
 	inv := new(big.Int).ModInverse(k, N)
 	r, _ := privkey.Curve.ScalarBaseMult(k.Bytes())
 	r.Mod(r, N)
@@ -450,7 +522,7 @@ func signRFC6979(privateKey *PrivateKey, hash []byte) (*Signature, error) {
 
 // nonceRFC6979 generates an ECDSA nonce (`k`) deterministically according to RFC 6979.
 // It takes a 32-byte hash as an input and returns 32-byte nonce to be used in ECDSA algorithm.
-func nonceRFC6979(privkey *big.Int, hash []byte) *big.Int {
+func nonceRFC6979(privkey *big.Int, hash, additionalData []byte) *big.Int {
 
 	curve := S256()
 	q := curve.Params().N
@@ -469,7 +541,11 @@ func nonceRFC6979(privkey *big.Int, hash []byte) *big.Int {
 	k := make([]byte, holen)
 
 	// Step D
-	k = mac(alg, k, append(append(v, 0x00), bx...))
+	if additionalData != nil {
+		k = mac(alg, k, append(append(append(v, 0x00), bx...), additionalData[:]...))
+	} else {
+		k = mac(alg, k, append(append(v, 0x00), bx...))
+	}
 
 	// Step E
 	v = mac(alg, k, v)
